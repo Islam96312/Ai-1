@@ -1,26 +1,42 @@
-max_risk_per_trade: 0.01           # 1% of balance
-max_risk_per_day: 0.03               # 3% of balance
-max_open_trades: 3                   # Max total open positions
-max_open_per_symbol: 1               # Max positions per symbol
-max_daily_loss: 0.02                 # 2% Daily Drawdown limit
-cooldown_after_loss: 30              # Minutes to wait after a loss
-min_risk_reward: 1.5                 # Minimum acceptable R:R ratio
-spread_threshold_pips: 3             # Max allowed spread
-slippage_threshold_pips: 2           # Max allowed slippage
-news_block_before_minutes: 15        # Block before high impact news
-news_block_after_minutes: 10         # Block after high impact news
-min_confidence_to_execute: 70        # Min AI confidence for auto-execution
-min_confidence_to_alert: 50          # Min AI confidence for alert
+# ============================================================
+# Risk Management Configuration
+# Tune these values to match your trading strategy & broker
+# ============================================================
 
-# Advanced Quant Settings
-use_kelly_criterion: true            # Use Kelly for dynamic lot sizing
-kelly_fraction: 0.2                  # "Fractional Kelly" (0.2 = 20% of Kelly to be safe)
-equity_curve_protection: true        # Reduce risk during drawdown
-drawdown_threshold: 0.05             # 5% drawdown triggers risk reduction
-risk_reduction_factor: 0.25          # Reduce risk to 25% of normal during DD
-max_currency_exposure: 0.03          # Max 3% total risk per currency (e.g., USD)
+# --- ATR-Based SL/TP Multipliers ---
+atr_multiplier_sl:  1.5   # Stop Loss  = ATR × 1.5
+atr_multiplier_tp1: 2.0   # Take Profit 1 = ATR × 2.0  (R:R = 1.33)
+atr_multiplier_tp2: 3.5   # Take Profit 2 = ATR × 3.5  (Partial close)
 
-stop_loss_method: "atr"              # Options: "atr", "swing", "fixed_pips"
-atr_multiplier_sl: 1.5               # SL = Entry +/- (ATR * 1.5)
-atr_multiplier_tp1: 2.0              # TP1 = Entry +/- (ATR * 2.0)
-atr_multiplier_tp2: 3.0              # TP2 = Entry +/- (ATR * 3.0)
+# --- Signal Quality Thresholds ---
+min_confidence_to_execute: 65.0   # Minimum final_score to allow trade (0–100)
+min_risk_reward:           1.2    # Minimum R:R ratio to allow trade
+
+# --- Position & Exposure Limits ---
+max_open_trades:        5         # Maximum concurrent open positions
+max_currency_exposure:  0.03      # Max 3% of balance exposed to single currency
+max_daily_drawdown:     0.05      # Halt trading if daily loss > 5% of balance
+risk_per_trade:         0.01      # Risk 1% of balance per trade
+
+# --- Spread Filter ---
+max_spread_pips:        3.0       # Skip trade if spread > 3 pips
+
+# --- Session Filter (UTC hours) ---
+# Only trade during active Forex sessions
+allowed_trading_hours:
+  start: 7    # 07:00 UTC (London open)
+  end:   20   # 20:00 UTC (New York close)
+
+# --- Symbol-Specific Pip Sizes ---
+# Used for accurate pip calculation
+pip_sizes:
+  EURUSD: 0.0001
+  GBPUSD: 0.0001
+  USDJPY: 0.01
+  USDCHF: 0.0001
+  AUDUSD: 0.0001
+  NZDUSD: 0.0001
+  USDCAD: 0.0001
+  XAUUSD: 0.1
+  XAGUSD: 0.001
+  default: 0.0001
