@@ -7,56 +7,61 @@ from typing import Dict, Any, Tuple
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MODEL_DIR = 'src/ai_layer/models'
+
+
 class MLModelService:
     """
-    Handles predictions and interpretability using the Ensemble Model.
+    Handles predictions using per-symbol Ensemble Models.
     """
-    def __init__(self, model_path: str = "src/ai_layer/models/ensemble_model.pkl"):
-        self.model_path = model_path
-        self.model = self._load_model()
+    def __init__(self):
+        self._models:  Dict[str, Any] = {}
+        self._scalers: Dict[str, Any] = {}
 
-    def _load_model(self):
-        if os.path.exists(self.model_path):
+    def _load(self, symbol: str, timeframe: str):
+        key = f'{symbol}_{timeframe}'
+        if key in self._models:
+            return
+        model_path  = os.path.join(MODEL_DIR, f'ensemble_{key}.pkl')
+        scaler_path = os.path.join(MODEL_DIR, f'scaler_{key}.pkl')
+        if os.path.exists(model_path):
             try:
-                with open(self.model_path, 'rb') as f:
-                    return pickle.load(f)
+                with open(model_path, 'rb')  as f: self._models[key]  = pickle.load(f)
+                if os.path.exists(scaler_path):
+                    with open(scaler_path, 'rb') as f: self._scalers[key] = pickle.load(f)
+                logger.info(f'Model loaded for {key}')
             except Exception as e:
-                logger.error(f"Error loading model: {e}")
-                return None
-        return None
+                logger.error(f'Error loading model {key}: {e}')
 
-    def predict(self, features_vector: np.ndarray) -> Tuple[str, float]:
-        """
-        Predicts direction and confidence using the ensemble.
-        """
-        if self.model is None:
-            return "HOLD", 0.5
-
+    def predict(self, symbol: str, timeframe: str, features_vector: np.ndarray) -> Tuple[str, float]:
+        self._load(symbol, timeframe)
+        key    = f'{symbol}_{timeframe}'
+        model  = self._models.get(key)
+        scaler = self._scalers.get(key)
+        if model is None:
+            return 'HOLD', 0.5
         try:
-            # features_vector should be 2D: (1, n_features)
             if features_vector.ndim == 1:
                 features_vector = features_vector.reshape(1, -1)
-                
-            probs = self.model.predict_proba(features_vector)[0]
-            prediction = np.argmax(probs)
-            confidence = probs[prediction]
-            
-            mapping = {0: "SELL", 1: "HOLD", 2: "BUY"}
-            return mapping[prediction], confidence
+            if scaler:
+                features_vector = scaler.transform(features_vector)
+            probs      = model.predict_proba(features_vector)[0]
+            prediction = int(np.argmax(probs))
+            mapping    = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
+            return mapping[prediction], float(probs[prediction])
         except Exception as e:
-            logger.error(f"Prediction error: {e}")
-            return "HOLD", 0.0
+            logger.error(f'Prediction error {key}: {e}')
+            return 'HOLD', 0.0
 
-    def get_feature_importance(self) -> Dict[str, float]:
-        """
-        Extracts importance from the Random Forest component of the ensemble.
-        """
-        if self.model is None: return {}
-        
-        # Access the Random Forest model inside the VotingClassifier
-        rf_model = self.model.named_estimators_['rf']
-        importances = rf_model.feature_importances_
-        
-        # Feature names used in ModelTrainer
-        names = ['ema_diff_20_50', 'ema_diff_50_200', 'rsi', 'macd_hist', 'adx', 'volatility', 'momentum']
-        return dict(zip(names, importances))
+    def get_feature_importance(self, symbol: str, timeframe: str) -> Dict[str, float]:
+        self._load(symbol, timeframe)
+        key   = f'{symbol}_{timeframe}'
+        model = self._models.get(key)
+        if model is None: return {}
+        try:
+            importances = model.named_estimators_['rf'].feature_importances_
+            names = ['ema_diff_20_50','ema_diff_50_200','rsi','macd_hist','adx','volatility','momentum']
+            return dict(zip(names, importances.tolist()))
+        except Exception as e:
+            logger.error(f'Feature importance error {key}: {e}')
+            return {}
