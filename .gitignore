@@ -1,4 +1,4 @@
-# Python
+# ── Python ──────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -9,37 +9,52 @@ dist/
 *.egg-info/
 .eggs/
 
-# Virtual Environments
-.env
-.venv
-env/
+# ── Virtual environments ─────────────────────────────────────────────
+.venv/
 venv/
+env/
+.env.local
+.env.*.local
 
-# Environment Variables (NEVER commit)
+# ── SECRETS — NEVER COMMIT ───────────────────────────────────────────
 .env
-.env.*
-!.env.example
+*.pem
+*.key
+secrets.yaml
+secrets.json
 
-# ML Models
+# ── AI / ML models ───────────────────────────────────────────────────
 src/ai_layer/models/*.pkl
 src/ai_layer/models/*.joblib
+src/ai_layer/models/*.h5
+src/ai_layer/models/*.pt
+src/ai_layer/models/*.onnx
+!src/ai_layer/models/.gitkeep
 
-# Logs
-*.log
+# ── Logs ─────────────────────────────────────────────────────────────
 logs/
+*.log
 
-# Database
+# ── Database ─────────────────────────────────────────────────────────
+*.sqlite
 *.db
-*.sqlite3
 
-# IDE
+# ── Coverage & test artifacts ────────────────────────────────────────
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# ── IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
+*.swo
 
-# OS
+# ── OS ───────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Docker volumes
-postgres_data/
+# ── Docker volumes ───────────────────────────────────────────────────
+pgdata/
+redis-data/

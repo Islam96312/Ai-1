@@ -1,42 +1,48 @@
-# ============================================================
-# Risk Management Configuration
-# Tune these values to match your trading strategy & broker
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+#  Risk Configuration
+#  Loaded automatically by RiskEngine and RiskFilters at startup.
+#  All values here override the hardcoded defaults in the code.
+# ══════════════════════════════════════════════════════════════════
 
-# --- ATR-Based SL/TP Multipliers ---
-atr_multiplier_sl:  1.5   # Stop Loss  = ATR × 1.5
-atr_multiplier_tp1: 2.0   # Take Profit 1 = ATR × 2.0  (R:R = 1.33)
-atr_multiplier_tp2: 3.5   # Take Profit 2 = ATR × 3.5  (Partial close)
+# ── RiskEngine: ATR multipliers for SL / TP levels ───────────────
+risk_engine:
+  # Stop Loss   = ATR × sl_atr_mult
+  # TP1 (first target)  = ATR × tp1_atr_mult  →  R:R ≈ 1.33
+  # TP2 (runner target) = ATR × tp2_atr_mult  →  R:R ≈ 2.33
+  sl_atr_mult:  1.5
+  tp1_atr_mult: 2.0
+  tp2_atr_mult: 3.5
 
-# --- Signal Quality Thresholds ---
-min_confidence_to_execute: 65.0   # Minimum final_score to allow trade (0–100)
-min_risk_reward:           1.2    # Minimum R:R ratio to allow trade
 
-# --- Position & Exposure Limits ---
-max_open_trades:        5         # Maximum concurrent open positions
-max_currency_exposure:  0.03      # Max 3% of balance exposed to single currency
-max_daily_drawdown:     0.05      # Halt trading if daily loss > 5% of balance
-risk_per_trade:         0.01      # Risk 1% of balance per trade
+# ── RiskFilters: trade validation thresholds ─────────────────────
+risk_filters:
 
-# --- Spread Filter ---
-max_spread_pips:        3.0       # Skip trade if spread > 3 pips
+  # Filter 1 — minimum AI confidence score (0-100)
+  # Trades below this score are rejected
+  min_confidence: 65.0
 
-# --- Session Filter (UTC hours) ---
-# Only trade during active Forex sessions
-allowed_trading_hours:
-  start: 7    # 07:00 UTC (London open)
-  end:   20   # 20:00 UTC (New York close)
+  # Filter 2 — minimum Risk:Reward ratio
+  # e.g. 1.2 means you must risk 1 to potentially gain 1.2
+  min_rr: 1.2
 
-# --- Symbol-Specific Pip Sizes ---
-# Used for accurate pip calculation
-pip_sizes:
-  EURUSD: 0.0001
-  GBPUSD: 0.0001
-  USDJPY: 0.01
-  USDCHF: 0.0001
-  AUDUSD: 0.0001
-  NZDUSD: 0.0001
-  USDCAD: 0.0001
-  XAUUSD: 0.1
-  XAGUSD: 0.001
-  default: 0.0001
+  # Filter 3 — allowed trading session windows (UTC hours)
+  # Trades outside ALL windows are rejected
+  sessions:
+    - name: London
+      open: 7
+      close: 16
+    - name: NewYork
+      open: 13
+      close: 21
+
+  # Filter 4 — maximum number of open positions at the same time
+  max_open_trades: 5
+
+  # Filter 5 — maximum risk per trade as % of account balance
+  # e.g. 2.0 = risk no more than 2% of balance on a single trade
+  max_risk_pct: 2.0
+
+  # Filter 6 — high-impact news block
+  # Trade is blocked if event_risk_score < this value
+  # event_risk_score is negative: -70 means 70-point penalty
+  news_block_threshold: -70.0
