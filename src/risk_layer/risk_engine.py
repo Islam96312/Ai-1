@@ -1,79 +1,174 @@
-import os
-import yaml
-import logging
-from typing import Dict, Any
-from database.schemas import TechnicalFeature
+"""
+RiskEngine
+==========
+Calculates SL, TP1, TP2, R:R and pip risk for a proposed trade.
 
-logging.basicConfig(level=logging.INFO)
+Logic:
+  - Uses ATR-based dynamic stops (configurable multipliers).
+  - Falls back to a fixed pip_size multiple if ATR is unavailable.
+  - Handles Decimal values from SQLAlchemy without TypeError.
+  - pip_size is symbol-aware (JPY pairs, metals, crypto).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from decimal import Decimal
+from typing import Any, Dict, Optional
+
 logger = logging.getLogger(__name__)
 
-# Default config used when risk_config.yaml is not found
-DEFAULT_CONFIG = {
-    'atr_multiplier_sl':  1.5,
-    'atr_multiplier_tp1': 2.0,
-    'atr_multiplier_tp2': 3.5,
-    'pip_sizes': {'default': 0.0001},
+# Default multipliers (overridable via config YAML)
+_DEFAULT_SL_ATR_MULT  = 1.5
+_DEFAULT_TP1_ATR_MULT = 2.0
+_DEFAULT_TP2_ATR_MULT = 3.5
+
+# Pip sizes by symbol (fallback map)
+_PIP_SIZES: Dict[str, float] = {
+    'default': 0.0001,
+    'JPY':     0.01,      # any pair containing JPY
+    'XAUUSD':  0.1,       # Gold
+    'XAGUSD':  0.001,     # Silver
+    'BTCUSD':  1.0,       # Bitcoin
+    'ETHUSD':  0.1,       # Ethereum
+    'USDJPY':  0.01,
+    'EURJPY':  0.01,
+    'GBPJPY':  0.01,
+    'CADJPY':  0.01,
+    'AUDJPY':  0.01,
+    'CHFJPY':  0.01,
+    'NZDJPY':  0.01,
 }
 
 
 class RiskEngine:
     """
-    Calculates Entry, Stop Loss, and Take Profit levels using ATR.
+    Calculates trade levels for a given symbol, direction, and price.
+
+    Usage::
+
+        engine = RiskEngine()
+        levels = engine.calculate_levels('EURUSD', 'BUY', 1.09000, features)
+        # levels = {'entry', 'stop_loss', 'take_profit_1', 'take_profit_2',
+        #           'risk_pips', 'risk_reward'}
     """
 
-    def __init__(self, config_path: str = 'config/risk_config.yaml'):
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
-            logger.info('RiskEngine: loaded config from %s', config_path)
-        else:
-            self.config = DEFAULT_CONFIG
-            logger.warning('RiskEngine: config file not found, using defaults')
+    def __init__(self, config_path: str = 'config/risk_config.yaml') -> None:
+        self.sl_mult  = _DEFAULT_SL_ATR_MULT
+        self.tp1_mult = _DEFAULT_TP1_ATR_MULT
+        self.tp2_mult = _DEFAULT_TP2_ATR_MULT
+        self._load_config(config_path)
 
-    def _pip_size(self, symbol: str) -> float:
-        pip_sizes = self.config.get('pip_sizes', {})
-        return pip_sizes.get(symbol, pip_sizes.get('default', 0.0001))
+    # ------------------------------------------------------------------ #
+    #  Config loader                                                       #
+    # ------------------------------------------------------------------ #
+    def _load_config(self, path: str) -> None:
+        if not os.path.exists(path):
+            return
+        try:
+            import yaml  # optional — only needed if config file exists
+            with open(path) as f:
+                cfg = yaml.safe_load(f) or {}
+            re_cfg = cfg.get('risk_engine', {})
+            self.sl_mult  = float(re_cfg.get('sl_atr_mult',  self.sl_mult))
+            self.tp1_mult = float(re_cfg.get('tp1_atr_mult', self.tp1_mult))
+            self.tp2_mult = float(re_cfg.get('tp2_atr_mult', self.tp2_mult))
+            logger.info('RiskEngine: loaded config from %s', path)
+        except Exception as exc:
+            logger.warning('RiskEngine: could not load config (%s). Using defaults.', exc)
 
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
     def calculate_levels(
         self,
         symbol: str,
         direction: str,
-        current_price: float,
-        features: TechnicalFeature,
-    ) -> Dict[str, Any]:
+        entry_price: float,
+        features: Any,
+    ) -> Dict[str, float]:
         """
-        Returns entry, SL, TP1, TP2, R:R, and risk in pips.
+        Return a dict with SL, TP1, TP2, risk_pips, and risk_reward.
+
+        Parameters
+        ----------
+        symbol      : e.g. 'EURUSD', 'XAUUSD'
+        direction   : 'BUY' or 'SELL'
+        entry_price : current ask/bid price (float)
+        features    : TechnicalFeature ORM object (must have .atr_14 attribute)
         """
-        # FIX: explicit float cast — atr_14 may be Decimal from DB
-        atr = float(features.atr_14) if features.atr_14 else self._pip_size(symbol) * 10
+        direction = direction.upper()
+        pip_size  = self._get_pip_size(symbol)
 
-        sl_mult  = self.config.get('atr_multiplier_sl',  1.5)
-        tp1_mult = self.config.get('atr_multiplier_tp1', 2.0)
-        tp2_mult = self.config.get('atr_multiplier_tp2', 3.5)
+        # --- Resolve ATR (Decimal-safe) --------------------------------
+        atr_raw = getattr(features, 'atr_14', None)
+        if atr_raw is not None:
+            try:
+                atr = float(atr_raw)
+            except (TypeError, ValueError):
+                atr = None
+        else:
+            atr = None
 
+        # --- Fallback if ATR missing or zero ---------------------------
+        if not atr:
+            atr = pip_size * 15  # 15-pip default
+            logger.debug('%s: ATR unavailable, using fallback ATR=%.6f', symbol, atr)
+
+        # --- SL distance -----------------------------------------------
+        sl_distance  = round(atr * self.sl_mult,  6)
+        tp1_distance = round(atr * self.tp1_mult, 6)
+        tp2_distance = round(atr * self.tp2_mult, 6)
+
+        # --- Calculate levels ------------------------------------------
         if direction == 'BUY':
-            sl  = current_price - (atr * sl_mult)
-            tp1 = current_price + (atr * tp1_mult)
-            tp2 = current_price + (atr * tp2_mult)
+            stop_loss     = round(entry_price - sl_distance,  6)
+            take_profit_1 = round(entry_price + tp1_distance, 6)
+            take_profit_2 = round(entry_price + tp2_distance, 6)
         else:  # SELL
-            sl  = current_price + (atr * sl_mult)
-            tp1 = current_price - (atr * tp1_mult)
-            tp2 = current_price - (atr * tp2_mult)
+            stop_loss     = round(entry_price + sl_distance,  6)
+            take_profit_1 = round(entry_price - tp1_distance, 6)
+            take_profit_2 = round(entry_price - tp2_distance, 6)
 
-        risk   = abs(current_price - sl)
-        reward = abs(tp1 - current_price)
+        # --- pip risk & R:R --------------------------------------------
+        risk_pips    = round(sl_distance  / pip_size, 1)
+        reward_pips  = round(tp1_distance / pip_size, 1)
+        risk_reward  = round(reward_pips / risk_pips, 2) if risk_pips > 0 else 0.0
 
-        # Guard: avoid division by zero
-        rr_ratio   = round(reward / risk, 2) if risk > 0 else 0.0
-        pip_size   = self._pip_size(symbol)
-        risk_pips  = round(risk / pip_size, 1) if pip_size > 0 else 0.0
-
-        return {
-            'entry':        round(current_price, 5),
-            'stop_loss':    round(sl,  5),
-            'take_profit_1': round(tp1, 5),
-            'take_profit_2': round(tp2, 5),
-            'risk_reward':  rr_ratio,
+        result = {
+            'entry':        round(entry_price, 6),
+            'stop_loss':    stop_loss,
+            'take_profit_1': take_profit_1,
+            'take_profit_2': take_profit_2,
             'risk_pips':    risk_pips,
-            'atr_used':     round(atr, 5),
+            'reward_pips':  reward_pips,
+            'risk_reward':  float(risk_reward),
         }
+
+        logger.debug(
+            '%s %s | entry=%.5f SL=%.5f TP1=%.5f TP2=%.5f R:R=%.2f',
+            direction, symbol,
+            result['entry'], result['stop_loss'],
+            result['take_profit_1'], result['take_profit_2'],
+            result['risk_reward'],
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+    def _get_pip_size(self, symbol: str) -> float:
+        """Return the pip/tick size for a given symbol."""
+        symbol_upper = symbol.upper()
+        if symbol_upper in _PIP_SIZES:
+            return _PIP_SIZES[symbol_upper]
+        if 'JPY' in symbol_upper:
+            return _PIP_SIZES['JPY']
+        if 'XAU' in symbol_upper or 'GOLD' in symbol_upper:
+            return _PIP_SIZES['XAUUSD']
+        if 'BTC' in symbol_upper:
+            return _PIP_SIZES['BTCUSD']
+        if 'ETH' in symbol_upper:
+            return _PIP_SIZES['ETHUSD']
+        return _PIP_SIZES['default']

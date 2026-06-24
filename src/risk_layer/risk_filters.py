@@ -1,104 +1,182 @@
-import os
-import yaml
-import logging
-from typing import Dict, Any, Tuple, List
-from datetime import datetime, timezone
+"""
+RiskFilters
+===========
+Validates a proposed trade signal against a set of configurable rules
+before it is sent to the execution layer.
 
-logging.basicConfig(level=logging.INFO)
+Filters applied in order:
+  1. Minimum confidence score
+  2. Minimum Risk : Reward ratio
+  3. Allowed trading session hours
+  4. Maximum open trades
+  5. Maximum risk per trade (% of balance)
+  6. High-impact news block (event_risk_score penalty)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG = {
-    'min_confidence_to_execute': 65.0,
-    'min_risk_reward':           1.2,
-    'max_open_trades':           5,
-    'max_currency_exposure':     0.03,
-    'max_spread_pips':           3.0,
-    'allowed_trading_hours':     {'start': 7, 'end': 20},
+# ── Default thresholds (overridable via config YAML) ──────────────────
+_DEFAULTS = {
+    'min_confidence':        65.0,   # minimum final_score to consider trading
+    'min_rr':                1.2,    # minimum risk:reward ratio
+    'max_open_trades':       5,      # maximum simultaneous positions
+    'max_risk_pct':          2.0,    # max % of balance at risk per trade
+    'news_block_threshold': -70.0,   # block trade if event_risk_score < this
+    # Session windows in UTC hours [open, close) — trades allowed inside
+    'sessions': [
+        {'name': 'London', 'open': 7,  'close': 16},
+        {'name': 'NewYork', 'open': 13, 'close': 21},
+    ],
 }
 
 
 class RiskFilters:
     """
-    Professional risk filters: confidence, R:R, session, spread,
-    open trade limit, and currency exposure.
+    Validates a trade signal before execution.
+
+    Usage::
+
+        filters = RiskFilters()
+        approved, reason = filters.validate_trade(
+            signal_data, sentiment, open_trades, account_balance
+        )
+        if not approved:
+            logger.info('Trade blocked: %s', reason)
     """
 
-    def __init__(self, config_path: str = 'config/risk_config.yaml'):
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
-            logger.info('RiskFilters: loaded config from %s', config_path)
-        else:
-            self.config = DEFAULT_CONFIG
-            logger.warning('RiskFilters: config file not found, using defaults')
+    def __init__(self, config_path: str = 'config/risk_config.yaml') -> None:
+        # Deep copy defaults so instances are independent
+        self.min_confidence       = _DEFAULTS['min_confidence']
+        self.min_rr               = _DEFAULTS['min_rr']
+        self.max_open_trades      = _DEFAULTS['max_open_trades']
+        self.max_risk_pct         = _DEFAULTS['max_risk_pct']
+        self.news_block_threshold = _DEFAULTS['news_block_threshold']
+        self.sessions             = list(_DEFAULTS['sessions'])
+        self._load_config(config_path)
 
-    @staticmethod
-    def _get_currencies(symbol: str):
-        """Extract base and quote currency from a symbol string."""
-        # Standard 6-char forex pairs
-        if len(symbol) == 6 and symbol.isalpha():
-            return symbol[:3].upper(), symbol[3:].upper()
-        # Metals: XAUUSD, XAGUSD
-        if symbol.upper().startswith(('XAU', 'XAG')):
-            return symbol[:3].upper(), symbol[3:6].upper()
-        return symbol[:3].upper(), symbol[3:6].upper()
+    # ------------------------------------------------------------------ #
+    #  Config loader                                                       #
+    # ------------------------------------------------------------------ #
+    def _load_config(self, path: str) -> None:
+        if not os.path.exists(path):
+            return
+        try:
+            import yaml
+            with open(path) as f:
+                cfg = yaml.safe_load(f) or {}
+            rf = cfg.get('risk_filters', {})
+            self.min_confidence       = float(rf.get('min_confidence',       self.min_confidence))
+            self.min_rr               = float(rf.get('min_rr',               self.min_rr))
+            self.max_open_trades      = int(rf.get('max_open_trades',        self.max_open_trades))
+            self.max_risk_pct         = float(rf.get('max_risk_pct',         self.max_risk_pct))
+            self.news_block_threshold = float(rf.get('news_block_threshold', self.news_block_threshold))
+            if 'sessions' in rf:
+                self.sessions = rf['sessions']
+            logger.info('RiskFilters: loaded config from %s', path)
+        except Exception as exc:
+            logger.warning('RiskFilters: could not load config (%s). Using defaults.', exc)
 
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
     def validate_trade(
         self,
         signal: Dict[str, Any],
         sentiment: Any,
-        open_trades: List[Dict[str, Any]] = None,   # FIX: default to empty list
-        current_balance: float = 10_000.0,
+        open_trades: Optional[List[Dict]] = None,
+        account_balance: float = 10_000.0,
     ) -> Tuple[bool, str]:
         """
-        Validates a signal against all risk rules.
-        Returns (approved: bool, reason: str).
+        Run all filters sequentially.  Returns (approved, reason).
+
+        Parameters
+        ----------
+        signal          : dict with keys: final_score, risk_reward, lot, risk_pips, symbol
+        sentiment       : SentimentScore ORM object (must have .event_risk_score)
+        open_trades     : list of open position dicts (or None -> treated as [])
+        account_balance : current account equity in account currency
         """
         if open_trades is None:
             open_trades = []
 
-        symbol = signal.get('symbol', '')
+        # ── Filter 1: Confidence ──────────────────────────────────────
+        score = float(signal.get('final_score', 0))
+        if score < self.min_confidence:
+            return False, f'Confidence {score:.1f} < {self.min_confidence} (min)'
 
-        # 1. Confidence threshold
-        confidence = signal.get('final_score', signal.get('confidence', 0))
-        min_conf   = self.config.get('min_confidence_to_execute', 65.0)
-        if confidence < min_conf:
-            return False, f'Confidence too low ({confidence:.1f} < {min_conf})'
+        # ── Filter 2: Risk : Reward ───────────────────────────────────
+        rr = float(signal.get('risk_reward', 0))
+        if rr < self.min_rr:
+            return False, f'R:R {rr:.2f} < {self.min_rr} (min)'
 
-        # 2. Risk:Reward ratio
-        rr       = signal.get('risk_reward', 0)
-        min_rr   = self.config.get('min_risk_reward', 1.2)
-        if rr < min_rr:
-            return False, f'R:R too low ({rr:.2f} < {min_rr})'
+        # ── Filter 3: Trading session ─────────────────────────────────
+        now_hour = datetime.now(tz=timezone.utc).hour
+        in_session = any(
+            s['open'] <= now_hour < s['close'] for s in self.sessions
+        )
+        if not in_session:
+            session_str = ', '.join(
+                f"{s['name']} {s['open']:02d}-{s['close']:02d} UTC"
+                for s in self.sessions
+            )
+            return False, f'Outside allowed trading hours ({session_str})'
 
-        # 3. Trading session filter (UTC)
-        now_utc   = datetime.now(timezone.utc)
-        hours_cfg = self.config.get('allowed_trading_hours', {})
-        h_start   = hours_cfg.get('start', 0)
-        h_end     = hours_cfg.get('end', 24)
-        if not (h_start <= now_utc.hour < h_end):
-            return False, f'Outside trading hours (UTC {now_utc.hour:02d}:xx — allowed {h_start}–{h_end})'
+        # ── Filter 4: Max open trades ─────────────────────────────────
+        if len(open_trades) >= self.max_open_trades:
+            return False, f'Max open trades reached ({len(open_trades)}/{self.max_open_trades})'
 
-        # 4. Open trades limit
-        max_trades = self.config.get('max_open_trades', 5)
-        if len(open_trades) >= max_trades:
-            return False, f'Max open trades reached ({len(open_trades)}/{max_trades})'
+        # ── Filter 5: Max risk per trade ──────────────────────────────
+        risk_pips = float(signal.get('risk_pips', 0))
+        lot       = float(signal.get('lot', 0.01))
+        symbol    = signal.get('symbol', '')
+        pip_value = self._get_pip_value(symbol)
+        trade_risk_usd = risk_pips * lot * pip_value * 10  # standard lot assumption
+        max_risk_usd   = account_balance * (self.max_risk_pct / 100)
+        if trade_risk_usd > max_risk_usd:
+            return False, (
+                f'Trade risk ${trade_risk_usd:.2f} exceeds max '
+                f'{self.max_risk_pct}% (${max_risk_usd:.2f}) of balance'
+            )
 
-        # 5. Currency exposure check
-        if symbol and current_balance > 0:
-            base, quote = self._get_currencies(symbol)
-            base_exp = 0.0
-            for trade in open_trades:
-                t_sym             = trade.get('symbol', '')
-                t_base, t_quote   = self._get_currencies(t_sym)
-                trade_risk_usd    = trade.get('lot', 0) * trade.get('risk_pips', 0) * 10.0
-                if t_base  == base:  base_exp += trade_risk_usd
-                if t_quote == base:  base_exp -= trade_risk_usd  # hedged
-
-            new_risk      = signal.get('lot', 0.01) * signal.get('risk_pips', 0) * 10.0
-            total_exp_pct = abs(base_exp + new_risk) / current_balance
-            max_exp       = self.config.get('max_currency_exposure', 0.03)
-            if total_exp_pct > max_exp:
-                return False, f'Excessive {base} exposure ({total_exp_pct*100:.1f}% > {max_exp*100:.0f}%)'
+        # ── Filter 6: High-impact news ────────────────────────────────
+        event_risk = float(getattr(sentiment, 'event_risk_score', 0) or 0)
+        if event_risk < self.news_block_threshold:
+            return False, (
+                f'High-impact news block: event_risk_score={event_risk:.0f} '
+                f'< threshold {self.news_block_threshold:.0f}'
+            )
 
         return True, 'Approved'
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+    def _get_currencies(self, symbol: str) -> Tuple[str, str]:
+        """Split a 6-char FX symbol into (base, quote). e.g. 'EURUSD' -> ('EUR','USD')."""
+        s = symbol.upper().replace('/', '')
+        if len(s) == 6:
+            return s[:3], s[3:]
+        # Fallback for non-standard lengths
+        return s[:3], s[3:] if len(s) > 3 else ''
+
+    def _get_pip_value(self, symbol: str) -> float:
+        """Approximate pip value in USD for common symbols (for risk % calc)."""
+        s = symbol.upper()
+        if 'JPY' in s:
+            return 0.91    # ~$0.91 per pip per 0.01 lot
+        if 'XAU' in s or 'GOLD' in s:
+            return 1.0
+        if 'GBP' in s:
+            return 1.27
+        if 'EUR' in s:
+            return 1.08
+        if 'AUD' in s or 'NZD' in s:
+            return 0.65
+        return 1.0         # USD pairs
